@@ -9,13 +9,18 @@ import os
 
 load_dotenv()
 
-DATA_FILE = os.getenv("DATA_FILE", "/home/data/staff_data.json")
+DATA_FILE = os.getenv("DATA_FILE", "data/staff_data.json")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID"))
 FAILED_REPORT_CHANNEL_ID = int(os.getenv("FAILED_REPORT_CHANNEL_ID", 0))
 FOUNDER_AND_OWNER_ROLE_ID = int(os.getenv("FOUNDER_AND_OWNER_ROLE_ID"))
 STAFF_ROLE_ID = int(os.getenv("STAFF_ROLE_ID"))
-MESSAGE_THRESHOLD = int(os.getenv("MESSAGE_THRESHOLD", 200))
+MESSAGE_THRESHOLD = 50
+CO_OWNER_ROLE_ID = int(os.getenv("CO_OWNER_ROLE_ID"))
+AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID"))
+ALLOWED_CHANNELS = set(int(x) for x in os.getenv("ALLOWED_CHANNELS", "").split(",") if x.strip())
+
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 staff_members_data = []
 data_dirty = False
@@ -73,12 +78,13 @@ async def sync_staff():
     stored_ids = {s["id"] for s in staff_members_data}
 
     for member_id in current_staff_ids - stored_ids:
-        staff_members_data.append({"id": member_id, "messages": 0, "failed_days": 0})
+        staff_members_data.append({"id": member_id, "messages": 0, "failed_days": 0, "bank": 0})
         print(f"[INFO] Added new staff member with ID {member_id}.")
 
     staff_members_data[:] = [s for s in staff_members_data if s["id"] in current_staff_ids]
 
     data_dirty = True
+    save_staff_data()
 
 @tasks.loop(minutes=5)
 async def auto_save():
@@ -101,6 +107,9 @@ async def on_message(message: discord.Message):
     global staff_members_data, data_dirty
     if message.author.bot:
         return
+    if ALLOWED_CHANNELS and message.channel.id not in ALLOWED_CHANNELS:
+        await bot.process_commands(message)
+        return
     for staff in staff_members_data:
         if staff["id"] == message.author.id:
             staff["messages"] += 1
@@ -118,7 +127,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
     if staff_role not in before.roles and staff_role in after.roles:
         if not any(s["id"] == after.id for s in staff_members_data):
-            staff_members_data.append({"id": after.id, "messages": 0, "failed_days": 0})
+            staff_members_data.append({"id": after.id, "messages": 0, "failed_days": 0, "bank": 0})
             data_dirty = True
             print(f"[INFO] {after.display_name} got staff role and was added.")
 
@@ -127,21 +136,27 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         data_dirty = True
         print(f"[INFO] {after.display_name} lost staff role and was removed.")
 
-# ---------------- Abbreviated commands ----------------
+@bot.event
+async def on_member_remove(member: discord.Member):
+    global staff_members_data, data_dirty
+    if any(s["id"] == member.id for s in staff_members_data):
+        staff_members_data[:] = [s for s in staff_members_data if s["id"] != member.id]
+        data_dirty = True
+        print(f"[INFO] {member.display_name} left the server and was removed from staff data.")
 
 @bot.command(name="h")
 async def help_command(ctx):
-    print(f"[COMMAND] .h called by {ctx.author}")
     await ctx.send(
         "📋 **Staff Bot Commands** 📋\n\n"
-        "**.d @staff-member**\n`Check failed days of a staff member.`\n\n"
-        "**.l**\n`List all staff members and their stats.`\n\n"
-        "**.rd @staff-member**\n`Reset failed days for a staff member (Founder/Owner only)`"
+        "**.m @staff-member**\nCheck message count of a staff member.\n\n"
+        "**.d @staff-member**\nCheck failed days of a staff member.\n\n"
+        "**.b @staff-member**\nCheck message bank of a staff member.\n\n"
+        "**.l**\nList all staff members and their stats.\n\n"
+        "**.sd @staff-member <days>**\nSet failed days for a staff member to a specific amount (Founder/Owner and Co-Owner only)"
     )
 
 @bot.command(name="l")
 async def list_staff(ctx):
-    print(f"[COMMAND] .l called by {ctx.author}")
     if not staff_members_data:
         await ctx.send("No staff data found.")
         return
@@ -152,96 +167,138 @@ async def list_staff(ctx):
         name = member.display_name if member else f"Unknown ({staff['id']})"
         embed.add_field(
             name=name,
-            value=f"Messages: {staff['messages']}\nFailed Days: {staff['failed_days']}",
+            value=f"Messages: {staff['messages']}\nFailed Days: {staff['failed_days']}\nBank: {staff['bank']}",
             inline=False
         )
     await ctx.send(embed=embed)
 
-@bot.command(name="d")
-async def check_days(ctx, member: discord.Member):
-    print(f"[COMMAND] .d called by {ctx.author} for {member}")
+@bot.command(name="m")
+async def check_messages(ctx, member: discord.Member = None):
+    if not member:
+        await ctx.send("Please mention a staff member. Usage: `.m @staff-member`")
+        return
     for staff in staff_members_data:
         if staff["id"] == member.id:
-            await ctx.send(f"{member.display_name} has {staff['failed_days']} failed days.")
-            print(f"[INFO] {member.display_name} has {staff['failed_days']} failed days.")
+            await ctx.send(f"{member.display_name} has sent {staff['messages']} messages today.")
             return
     await ctx.send("That user is not registered as staff.")
 
-@bot.command(name="rd")
-async def reset_days(ctx, target=None):
+@bot.command(name="d")
+async def check_days(ctx, member: discord.Member = None):
+    if not member:
+        await ctx.send("Please mention a staff member. Usage: `.d @staff-member`")
+        return
+    for staff in staff_members_data:
+        if staff["id"] == member.id:
+            await ctx.send(f"{member.display_name} has {staff['failed_days']} failed days.")
+            return
+    await ctx.send("That user is not registered as staff.")
+
+@bot.command(name="b")
+async def check_bank(ctx, member: discord.Member = None):
+    if not member:
+        await ctx.send("Please mention a staff member. Usage: `.b @staff-member`")
+        return
+    for staff in staff_members_data:
+        if staff["id"] == member.id:
+            await ctx.send(f"{member.display_name} has {staff['bank']} messages in their bank.")
+            return
+    await ctx.send("That user is not registered as staff.")
+
+def has_sd_permission(ctx):
+    role_ids = [r.id for r in ctx.author.roles]
+    return (
+        FOUNDER_AND_OWNER_ROLE_ID in role_ids or
+        CO_OWNER_ROLE_ID in role_ids or
+        ctx.author.id == AUTHORIZED_USER_ID
+    )
+
+@bot.command(name="sd")
+async def set_days(ctx, target: str = None, days: int = None):
     global data_dirty
-    print(f"[COMMAND] .rd called by {ctx.author} with target {target}")
-    if FOUNDER_AND_OWNER_ROLE_ID not in [r.id for r in ctx.author.roles]:
+    if not has_sd_permission(ctx):
         await ctx.send("You do not have permission to use this command.")
         return
-    if not target:
-        await ctx.send("Please mention a staff member or @everyone.")
+    if target is None:
+        await ctx.send("Please provide a member and number of days. Usage: `.sd @staff-member <days>` or `.sd @everyone <days>`")
         return
-    if target == "@everyone":
+    if days is None:
+        await ctx.send("Please provide the number of days. Usage: `.sd @staff-member <days>` or `.sd @everyone <days>`")
+        return
+    if days < 0:
+        await ctx.send("Days cannot be negative.")
+        return
+    if target.lower() == "@everyone":
         for staff in staff_members_data:
-            staff["failed_days"] = 0
+            staff["failed_days"] = days
         data_dirty = True
-        await ctx.send("Reset failed days for all staff members.")
-        print("[INFO] Reset failed days for all staff.")
+        save_staff_data()
+        await ctx.send(f"Set failed days to {days} for all staff members.")
         return
     if ctx.message.mentions:
         member = ctx.message.mentions[0]
         for staff in staff_members_data:
             if staff["id"] == member.id:
-                staff["failed_days"] = 0
+                staff["failed_days"] = days
                 data_dirty = True
-                await ctx.send(f"Reset failed days for {member.display_name}.")
-                print(f"[INFO] Reset failed days for {member.display_name}")
+                save_staff_data()
+                await ctx.send(f"Set failed days for {member.display_name} to {days}.")
                 return
         await ctx.send("That user is not registered as staff.")
         return
-    await ctx.send("Invalid input. Mention a user or use @everyone.")
-
-# ---------------- Daily check loop ----------------
+    await ctx.send("Invalid usage. Usage: `.sd @staff-member <days>` or `.sd @everyone <days>`")
 
 @tasks.loop(hours=24)
 async def daily_check():
-    ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    now_ist = now_utc.astimezone(ist)
-    target = now_ist.replace(hour=23, minute=55, second=0, microsecond=0)
-    if now_ist >= target:
-        target += datetime.timedelta(days=1)
-    await asyncio.sleep((target - now_ist).total_seconds())
+    try:
+        now_ist = datetime.datetime.now(IST)
+        target = now_ist.replace(hour=1, minute=0, second=0, microsecond=0)
+        if now_ist >= target:
+            target += datetime.timedelta(days=1)
+        await asyncio.sleep((target - now_ist).total_seconds())
 
-    global staff_members_data, data_dirty
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        print("[WARN] Guild not found for daily check.")
-        return
+        global staff_members_data, data_dirty
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            return
 
-    failed_today = []
-    for staff in staff_members_data:
-        if staff["messages"] < MESSAGE_THRESHOLD:
-            staff["failed_days"] += 1
-            member = guild.get_member(staff["id"])
-            name = member.display_name if member else f"Unknown ({staff['id']})"
-            failed_today.append(f"{name}: {staff['messages']} messages")
-            print(f"[INFO] {name} failed today with {staff['messages']} messages")
-        staff["messages"] = 0
+        failed_today = []
 
-    data_dirty = True
+        for staff in staff_members_data:
+            if staff["messages"] > MESSAGE_THRESHOLD:
+                extra = staff["messages"] - MESSAGE_THRESHOLD
+                staff["bank"] += extra // 2
 
-    if FAILED_REPORT_CHANNEL_ID:
-        channel = guild.get_channel(FAILED_REPORT_CHANNEL_ID)
-        if channel:
-            if failed_today:
-                report = "📉 **Failed Staff Today:**\n" + "\n".join(failed_today)
-            else:
-                report = "🎉 No failed staff today!"
-            await channel.send(report)
-            print(f"[INFO] Daily report sent.")
-        else:
-            print("⚠️ FAILED_REPORT_CHANNEL_ID not found in guild.")
-    else:
-        print("⚠️ FAILED_REPORT_CHANNEL_ID not set; skipping daily report.")
+            needed = MESSAGE_THRESHOLD - staff["messages"]
 
-# ---------------- Run bot ----------------
+            if needed > 0:
+                if staff["bank"] >= needed:
+                    staff["bank"] -= needed
+                    staff["messages"] += needed
+                else:
+                    staff["failed_days"] += 1
+                    member = guild.get_member(staff["id"])
+                    name = member.display_name if member else f"Unknown ({staff['id']})"
+                    failed_today.append(
+                      f"{name}: {staff['messages']} messages "
+                      f"(Bank had: {staff['bank']})"
+                    )
+
+            staff["messages"] = 0
+
+        data_dirty = True
+        save_staff_data()
+
+        if FAILED_REPORT_CHANNEL_ID:
+            channel = guild.get_channel(FAILED_REPORT_CHANNEL_ID)
+            if channel:
+                if failed_today:
+                    report = "📉 **Failed Staff Today:**\n" + "\n".join(failed_today)
+                else:
+                    report = "🎉 No failed staff today!"
+                await channel.send(report)
+    except Exception as e:
+        print(f"[ERROR] daily_check failed: {e}")
 
 try:
     bot.run(DISCORD_TOKEN, log_handler=handler, log_level=logging.INFO)
